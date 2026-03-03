@@ -59,8 +59,8 @@ class DatasetInfo(NamedTuple):
 VARIANT_ELASTIC = "elastic"
 VARIANT_ANELASTIC = "anelastic"
 
-PML_TOKEN_RE = re.compile(r"^pml-(?P<mode>on|off|60|\d+(?:\.\d+)?)$", flags=re.IGNORECASE)
-RES_TOKEN_RE = re.compile(r"^res-(?P<value>[+-]?(?:\d+(?:\.\d+)?|\.\d+))$", flags=re.IGNORECASE)
+PML_TOKEN_RE = re.compile(r"^pml-(?P<mode>[^_]+)$", flags=re.IGNORECASE)
+RES_TOKEN_RE = re.compile(r"^res-(?P<value>[^_]+)$", flags=re.IGNORECASE)
 TEST_TOKEN_RE = re.compile(r"(?:^|[_-])test[-_]?(?P<id>\d+[a-z]?)", flags=re.IGNORECASE)
 CG_VALUE_RE = re.compile(r"(?:^|[_-])cg-(?P<val>\d+)(?:[_-]|$)", flags=re.IGNORECASE)
 ANELASTIC_GAMMA_RE = re.compile(r"anelastic[-_]gamma-(?P<val>[+-]?(?:\d+(?:\.\d+)?|\.\d+))", flags=re.IGNORECASE)
@@ -73,9 +73,25 @@ def dataset_base_and_variant(dataset_name: str) -> Tuple[str, Optional[str]]:
     name = dataset_name
     if name.endswith('.dat'):
         name = name[:-4]
+
+    # If filename ends with three numeric components (x_y_z) treat those as station coords
     parts = name.split('_')
     if len(parts) > 3 and all(re.match(r'^-?\d+(\.\d+)?$', p) for p in parts[-3:]):
         name = '_'.join(parts[:-3])
+
+    # Try to pull out explicit variant tokens (anelastic/elastic) so callers get a clean base
+    # Prefer the more specific anelastic-gamma token, falling back to plain 'elastic'
+    m = ANELASTIC_GAMMA_RE.search(name)
+    if m:
+        # remove the matched token from the base name but keep separators
+        base = ANELASTIC_GAMMA_RE.sub('_', name)
+        base = re.sub(r'_+', '_', base).strip('_')
+        return base, m.group('val')
+    if ELASTIC_RE.search(name):
+        base = ELASTIC_RE.sub('_', name)
+        base = re.sub(r'_+', '_', base).strip('_')
+        return base, 'elastic'
+
     return name, None
 
 
@@ -149,6 +165,10 @@ def pml_label(pml_mode: str) -> str:
         return "3.0"
     if mode == "60":
         return "6.0"
+    # Try to extract leading numeric value (strip units like 'km' or 'm')
+    m = re.match(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)", mode)
+    if m:
+        return m.group(1)
     return pml_mode
 
 def iter_dataset_files(data_dir: Path) -> List[Path]:
@@ -454,56 +474,53 @@ def update_dataset_table(selected_station: str, selection_store: Dict):
 
     header = html.Thead(html.Tr([html.Th("Test"), html.Th("CG"), html.Th("Stencil"), html.Th("Order"), html.Th("Res"), html.Th("PML"), html.Th("Ver."), html.Th("Elastic"), html.Th("Anelastic")]))
 
+    # Build table rows directly from base_order. This also acts as a fallback when
+    # stencil-based grouping yields no results (so datasets still show up).
     rows = []
-    for stencil in sorted_stencils:
-        sorted_keys = sorted(stencil_to_variants[stencil].keys(), key=sort_key)
-        for i, key in enumerate(sorted_keys):
-            test_id, order, res, pml_mode, ver = key
-            base = f"test{test_id}_{stencil}_{order}" if test_id else f"{stencil}_{order}"
-            if res:
-                base += f"_res-{res}"
-            base += f"_pml-{pml_mode}"
-            if ver:
-                base += f"_{ver}"
-            variants = grouped[base]
-            elastic_path, anelastic_path = variants.get(VARIANT_ELASTIC), variants.get(VARIANT_ANELASTIC)
-            saved = selection_store.get(base, {}) if isinstance(selection_store, dict) else {}
-            
-            elastic_cell = html.Td(
-                dcc.Checklist(
-                    id={"type": "dataset-elastic", "base": base},
-                    options=[{"label": "0.0", "value": "on", "disabled": elastic_path is None}],
-                    value=["on"] if bool(saved.get(VARIANT_ELASTIC)) and elastic_path else [],
-                ),
-                style={"textAlign": "right"},
-            )
-            gamma_label = base_to_gamma.get(base, "")
-            anelastic_cell = html.Td(
-                dcc.Checklist(
-                    id={"type": "dataset-anelastic", "base": base},
-                    options=[{"label": gamma_label, "value": "on", "disabled": anelastic_path is None}],
-                    value=["on"] if bool(saved.get(VARIANT_ANELASTIC)) and anelastic_path else [],
-                ),
-                style={"textAlign": "left"},
-            )
+    for base in base_order:
+        variants = grouped.get(base, {})
+        elastic_path = variants.get(VARIANT_ELASTIC)
+        anelastic_path = variants.get(VARIANT_ANELASTIC)
+        saved = selection_store.get(base, {}) if isinstance(selection_store, dict) else {}
 
-            pml_val = pml_label(pml_mode)
-            ver_val = ver
-            res_display = res if res else "-"
-            test_val = test_id
-            cg_val = base_to_cg.get(base, "")
+        elastic_cell = html.Td(
+            dcc.Checklist(
+                id={"type": "dataset-elastic", "base": base},
+                options=[{"label": "0.0", "value": "on", "disabled": elastic_path is None}],
+                value=["on"] if bool(saved.get(VARIANT_ELASTIC)) and elastic_path else [],
+            ),
+            style={"textAlign": "right"},
+        )
+        gamma_label = base_to_gamma.get(base, "")
+        anelastic_cell = html.Td(
+            dcc.Checklist(
+                id={"type": "dataset-anelastic", "base": base},
+                options=[{"label": gamma_label or "anelastic", "value": "on", "disabled": anelastic_path is None}],
+                value=["on"] if bool(saved.get(VARIANT_ANELASTIC)) and anelastic_path else [],
+            ),
+            style={"textAlign": "left"},
+        )
 
-            row_children = [html.Td(test_val, style={"textAlign": "center"}), html.Td(cg_val, style={"textAlign": "center"})]
-            row_children += [html.Td(stencil, rowSpan=len(sorted_keys), style={"textAlign": "center"})] if i == 0 else []
-            row_children.extend([
-                html.Td(order, style={"textAlign": "center"}),
-                html.Td(res_display, style={"textAlign": "center"}),
-                html.Td(pml_val, style={"textAlign": "center"}),
-                html.Td(ver_val, style={"textAlign": "center"}),
-                elastic_cell,
-                anelastic_cell,
-            ])
-            rows.append(html.Tr(row_children))
+        # Try to extract display tokens from base string for nicer columns
+        test_val = parse_test_id(base)
+        cg_val = base_to_cg.get(base, "")
+
+        m_pml = re.search(r"pml-(?P<mode>[^_]+)", base, flags=re.IGNORECASE)
+        pml_val = pml_label(m_pml.group('mode')) if m_pml else "-"
+        m_res = re.search(r"res-(?P<value>[^_]+)", base, flags=re.IGNORECASE)
+        res_display = m_res.group('value') if m_res else "-"
+        m_stencil = re.search(r"(traditional|upwind|upwind-drp)_([^_]+)", base)
+        if m_stencil:
+            stencil_val = m_stencil.group(1)
+            order_val = m_stencil.group(2)
+        else:
+            stencil_val = "-"
+            order_val = "-"
+
+        ver_val = ""
+
+        row_children = [html.Td(test_val, style={"textAlign": "center"}), html.Td(cg_val, style={"textAlign": "center"}), html.Td(stencil_val, style={"textAlign": "center"}), html.Td(order_val, style={"textAlign": "center"}), html.Td(res_display, style={"textAlign": "center"}), html.Td(pml_val, style={"textAlign": "center"}), html.Td(ver_val, style={"textAlign": "center"}), elastic_cell, anelastic_cell]
+        rows.append(html.Tr(row_children))
 
     return dbc.Table([header, html.Tbody(rows)], bordered=True, hover=True, size="sm", responsive=True), grouped, base_order
 
@@ -540,7 +557,7 @@ def update_plot(station, plots_selected, elastic_values, anelastic_values, plot_
                     if info:
                         selected_infos.append(info)
             if idx < len(anelastic_values) and anelastic_values[idx]:
-                p = variants.get(VARIANT_ANELASTIC_C2)
+                p = variants.get(VARIANT_ANELASTIC)
                 if p:
                     info = parse_dataset_info(Path(p))
                     if info:
